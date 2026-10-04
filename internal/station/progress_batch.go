@@ -12,6 +12,15 @@ type ProgressBatchResult struct {
 	Entries      []domain.ProgressEntry `json:"entries"`
 }
 
+// preparedBatchItem holds every change produced by one entry of a merged
+// submission. The values are derived without touching the transaction so a
+// later rejected entry can abort the whole batch cleanly.
+type preparedBatchItem struct {
+	entry    domain.ProgressEntry
+	plan     domain.PrepPlan
+	specimen domain.Specimen
+}
+
 func batchItems(request contracts.BatchProgressRequest) []domain.ProgressBatchItem {
 	items := make([]domain.ProgressBatchItem, 0, len(request.Entries))
 	for _, entry := range request.Entries {
@@ -32,25 +41,39 @@ func applyProgressBatch(
 	submission domain.ProgressBatchSubmission,
 	result *ProgressBatchResult,
 ) error {
+	// A repeated delivery of an already accepted submission replays the
+	// original outcome and never applies the payload a second time.
 	if existing, ok := m.GetProgressBatch(submission.SubmissionID); ok {
 		result.Entries = append(result.Entries[:0], existing.Entries...)
 		return nil
 	}
-	result.Entries = result.Entries[:0]
+
+	// Phase 1: prepare every entry in working memory. This performs all
+	// validation and state-machine transitions without a single transaction
+	// write, so one unacceptable entry aborts the whole batch and leaves no
+	// progress, completion or stabilization behind.
+	prepared := make([]preparedBatchItem, 0, len(submission.Items))
 	for _, item := range submission.Items {
-		entry, plan, specimen, err := prepareBatchProgress(s, m, item)
+		preparedItem, err := prepareBatchProgress(s, m, item)
 		if err != nil {
 			return err
 		}
-		m.AppendProgress(entry)
-		m.PutPlan(plan)
-		m.PutSpecimen(specimen)
-		result.Entries = append(result.Entries, entry)
+		prepared = append(prepared, preparedItem)
+	}
+
+	// Phase 2: every entry was accepted, so commit the entire batch together.
+	entries := make([]domain.ProgressEntry, 0, len(prepared))
+	for _, item := range prepared {
+		m.AppendProgress(item.entry)
+		m.PutPlan(item.plan)
+		m.PutSpecimen(item.specimen)
+		entries = append(entries, item.entry)
 	}
 	m.PutProgressBatch(domain.ProgressBatch{
 		SubmissionID: submission.SubmissionID,
-		Entries:      append([]domain.ProgressEntry(nil), result.Entries...),
+		Entries:      entries,
 	})
+	result.Entries = append(result.Entries[:0], entries...)
 	return nil
 }
 
@@ -58,14 +81,14 @@ func prepareBatchProgress(
 	s *Service,
 	m *repository.Mutation,
 	item domain.ProgressBatchItem,
-) (domain.ProgressEntry, domain.PrepPlan, domain.Specimen, error) {
+) (preparedBatchItem, error) {
 	plan, ok := m.GetPlan(item.PlanID)
 	if !ok {
-		return domain.ProgressEntry{}, domain.PrepPlan{}, domain.Specimen{}, notFoundPlan(item.PlanID)
+		return preparedBatchItem{}, notFoundPlan(item.PlanID)
 	}
 	specimen, ok := m.GetSpecimen(plan.SpecimenID)
 	if !ok {
-		return domain.ProgressEntry{}, domain.PrepPlan{}, domain.Specimen{}, notFoundSpecimen(plan.SpecimenID)
+		return preparedBatchItem{}, notFoundSpecimen(plan.SpecimenID)
 	}
 	previous := m.ProgressForPlan(item.PlanID)
 	entry, err := domain.NewProgressEntry(
@@ -79,20 +102,20 @@ func prepareBatchProgress(
 		s.now(),
 	)
 	if err != nil {
-		return domain.ProgressEntry{}, domain.PrepPlan{}, domain.Specimen{}, err
+		return preparedBatchItem{}, err
 	}
 	if plan.Status == domain.PlanApproved {
 		if err := plan.Begin(s.now()); err != nil {
-			return domain.ProgressEntry{}, domain.PrepPlan{}, domain.Specimen{}, err
+			return preparedBatchItem{}, err
 		}
 	}
 	if item.Percent == 100 {
 		if err := plan.Complete(s.now()); err != nil {
-			return domain.ProgressEntry{}, domain.PrepPlan{}, domain.Specimen{}, err
+			return preparedBatchItem{}, err
 		}
 		if err := specimen.MarkStabilized(s.now()); err != nil {
-			return domain.ProgressEntry{}, domain.PrepPlan{}, domain.Specimen{}, err
+			return preparedBatchItem{}, err
 		}
 	}
-	return entry, plan, specimen, nil
+	return preparedBatchItem{entry: entry, plan: plan, specimen: specimen}, nil
 }
